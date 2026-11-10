@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from html import escape
+import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 def _gray(array: np.ndarray, low: float, high: float) -> np.ndarray:
@@ -37,6 +38,76 @@ def _metric(frame: dict, *keys: str) -> str:
     return "—"
 
 
+def _extra_arrays(directory, manifest, shape):
+    """Load persisted screening maps without calling them anatomical validity."""
+    from .io import read_sequence
+    result = {}
+    for name, key in (("support", "correspondence_file"), ("confidence", "confidence_file")):
+        if manifest.get(key):
+            value, _ = read_sequence(directory / manifest[key])
+            if value.shape != shape or not np.isfinite(value).all():
+                raise ValueError(f"Invalid {key} for review")
+            if name == "support" and not np.isin(value,[0,1]).all():
+                raise ValueError("Correspondence support must be binary")
+            if name == "confidence" and (np.any(value < 0) or np.any(value > 1)):
+                raise ValueError("Confidence scores must be finite values in [0,1]")
+            result[name] = value
+    return result
+
+
+def _field_views(directory, frame, original, low, high):
+    """Create displacement/grid and optional coarse views from the saved pull map."""
+    path = frame.get("field_file")
+    if not path:
+        return {}
+    field_path = directory / path
+    if frame.get("field_sha256") and hashlib.sha256(field_path.read_bytes()).hexdigest() != frame["field_sha256"]:
+        raise ValueError("Transform fingerprint mismatch while generating review")
+    with np.load(field_path, allow_pickle=False) as stored:
+        field = np.asarray(stored["pull_displacement_yx"], dtype=float)
+    if field.shape != (2, *original.shape) or not np.isfinite(field).all():
+        raise ValueError("Invalid pull displacement for review")
+    magnitude = np.linalg.norm(field, axis=0)
+    scale = max(float(np.percentile(magnitude, 99)), 1.)
+    heat = np.zeros((*original.shape, 3), dtype=np.uint8)
+    strength = np.clip(magnitude / scale, 0, 1)
+    heat[..., 0] = np.uint8(255 * strength)
+    heat[..., 1] = np.uint8(210 * strength ** .5)
+    heat[..., 2] = np.uint8(110 * (1-strength))
+    grid_image = Image.fromarray(_gray(original, low, high)).convert("RGB")
+    draw = ImageDraw.Draw(grid_image)
+    height, width = original.shape
+    spacing = max(12, min(height, width)//16)
+    # The grid shows where fixed-grid points sample the original moving image.
+    for y in range(spacing//2, height, spacing):
+        points = [(float(x + field[1, y, x]), float(y + field[0, y, x])) for x in range(0, width, 3)]
+        if len(points)>1:
+            draw.line(points, fill=(40, 235, 220), width=1)
+    for x in range(spacing//2, width, spacing):
+        points = [(float(x + field[1, y, x]), float(y + field[0, y, x])) for y in range(0, height, 3)]
+        if len(points)>1:
+            draw.line(points, fill=(40, 235, 220), width=1)
+    views = {"displacement": heat, "deformation": np.asarray(grid_image)}
+    matrix = frame.get("coarse_pull_matrix_xy")
+    if matrix is not None:
+        from scipy.ndimage import map_coordinates
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.shape != (3,3) or not np.isfinite(matrix).all():
+            raise ValueError("Invalid coarse pull matrix for review")
+        yy, xx = np.mgrid[:height, :width]
+        # Avoid spurious floating-point warnings from small Accelerate BLAS products.
+        points = np.einsum("ij,jk->ik", matrix,
+                           np.stack((xx.ravel(), yy.ravel(), np.ones(height*width))),
+                           optimize=False)
+        if not np.allclose(points[2], 1):
+            raise ValueError("Expected affine coarse pull coordinates")
+        coarse = map_coordinates(np.asarray(original, dtype=np.float32),
+                                 [points[1].reshape(height,width), points[0].reshape(height,width)],
+                                 order=1, mode="constant", cval=float(np.median(original)), prefilter=False)
+        views["coarse"] = _gray(coarse, low, high)
+    return views
+
+
 def write_report(output_dir, manifest: dict, originals: np.ndarray, registered: np.ndarray,
                  validity: np.ndarray) -> Path:
     """Write report.html and PNG previews, preserving original frame index labels.
@@ -63,12 +134,19 @@ def write_report(output_dir, manifest: dict, originals: np.ndarray, registered: 
     low, high = np.nanpercentile(sample, (0.5, 99.5))
     ref_gray = _gray(originals[reference_index], low, high)
     _save_preview(assets / "reference.png", ref_gray)
+    schema2 = manifest.get("schema_version") == 2
+    maps = _extra_arrays(directory, manifest, originals.shape) if schema2 else {}
+    if schema2:
+        Image.fromarray(ref_gray).save(assets / "reference-full.png")
     included = [i for i, frame in enumerate(frames) if frame.get("included_in_minip", True)]
     bright = manifest.get("config", {}).get("polarity", "dark") == "bright"
     reducer, padding = (np.max, -np.inf) if bright else (np.min, np.inf)
     if included:
         before_minip = reducer(originals[included], axis=0)
-        after_minip = reducer(np.where(validity[included], registered[included], padding), axis=0)
+        projection_support = validity[included].astype(bool)
+        if "support" in maps:
+            projection_support = projection_support & maps["support"][included].astype(bool)
+        after_minip = reducer(np.where(projection_support, registered[included], padding), axis=0)
     else:
         before_minip = np.full(originals.shape[1:], high)
         after_minip = before_minip.copy()
@@ -88,14 +166,38 @@ def write_report(output_dir, manifest: dict, originals: np.ndarray, registered: 
             "after": _overlay(ref_gray, aligned_gray, validity[index]),
         }
         urls = {}
+        full_urls = {}
         for key, pixels in images.items():
             filename = f"{prefix}-{key}.png"
             _save_preview(assets / filename, pixels)
             urls[key] = f"review/{filename}"
+            if schema2:
+                full_filename = f"{prefix}-{key}-full.png"
+                Image.fromarray(pixels).save(assets / full_filename)
+                full_urls[key] = f"review/{full_filename}"
+        extra_urls = {}
+        if schema2:
+            extras = _field_views(directory, frame, originals[index], low, high)
+            if "support" in maps:
+                # Orange denotes unsupported correspondence, not zero-intensity image padding.
+                support_overlay = np.repeat(aligned_gray[..., None], 3, axis=-1)
+                effective_support = maps["support"][index].astype(bool) & validity[index].astype(bool)
+                support_overlay[~effective_support] = (235,115,25)
+                extras["support"] = support_overlay
+            if "confidence" in maps:
+                confidence = np.clip(maps["confidence"][index], 0, 1)
+                extras["confidence"] = np.stack((np.uint8(255*(1-confidence)),
+                                                   np.uint8(255*confidence), np.zeros_like(aligned_gray)),axis=-1)
+            if "coarse" in extras:
+                extras["coarse"] = _overlay(ref_gray, extras["coarse"])
+            for key,pixels in extras.items():
+                filename = f"{prefix}-{key}.png"
+                Image.fromarray(pixels).save(assets / filename)
+                extra_urls[key] = f"review/{filename}"
         status = str(frame.get("status", "review"))
         source = int(frame["source_frame"])
-        dy = float(frame.get("shift_y_px", 0))
-        dx = float(frame.get("shift_x_px", 0))
+        dy = float(frame.get("coarse_shift_y_px", frame.get("shift_y_px", 0)))
+        dx = float(frame.get("coarse_shift_x_px", frame.get("shift_x_px", 0)))
         before = _metric(frame, "ncc_before", "correlation_before", "before_ncc")
         after = _metric(frame, "ncc_after", "correlation_after", "after_ncc")
         reason = frame.get("reasons", frame.get("flags", frame.get("reason", [])))
@@ -103,6 +205,11 @@ def write_report(output_dir, manifest: dict, originals: np.ndarray, registered: 
             reason = "; ".join(map(str, reason))
         item = {"index": index, "source": source, "status": status, "dx": dx, "dy": dy,
                 "before_ncc": before, "after_ncc": after, "reason": str(reason), "urls": urls}
+        if schema2:
+            item.update(full_urls=full_urls, extra_urls=extra_urls,
+                        registration_valid=frame.get("registration_valid") is True,
+                        qa={key:frame[key] for key in ("qa", "inverse_qa", "match_count", "support_fraction",
+                             "evaluation", "duplicate_of_source_frame", "field_sha256") if key in frame})
         items.append(item)
         flagged = status not in ("accepted", "reference", "manual", "ok", "estimated")
         rows.append(f'<tr class="{"flagged" if flagged else ""}"><td><button onclick="show({index})">{source}</button></td>'
@@ -110,9 +217,15 @@ def write_report(output_dir, manifest: dict, originals: np.ndarray, registered: 
                     f'<td>{before}</td><td>{after}</td><td>{escape(str(reason))}</td></tr>')
     # JSON is inert inside this data block; escape '<' to prevent HTML termination.
     data = json.dumps(items, allow_nan=False).replace("<", "\\u003c")
+    manifest_path = directory / "manifest.json"
+    fingerprint = hashlib.sha256(manifest_path.read_bytes()).hexdigest() if manifest_path.is_file() else ""
     editor_data = json.dumps({"config": manifest.get("config", {}),
                               "shape": list(originals.shape[1:]),
-                              "run_id": manifest.get("run_id", "sequence")},
+                              "run_id": manifest.get("run_id", "sequence"),
+                              "group_id": manifest.get("group_id"),
+                              "manifest_sha256": fingerprint,
+                              "schema_version": manifest.get("schema_version",1),
+                              "registration_method": manifest.get("registration_method", "translation")},
                              allow_nan=False).replace("<", "\\u003c")
     title = escape(str(manifest.get("run_id", Path(manifest.get("source_file", "DSA sequence")).stem)))
     configured_roi = manifest.get("config", {}).get("roi", manifest.get("roi"))
@@ -120,6 +233,34 @@ def write_report(output_dir, manifest: dict, originals: np.ndarray, registered: 
     document = _HTML.replace("__TITLE__", title).replace("__REFERENCE__", str(reference_frame))
     document = document.replace("__ROI__", roi).replace("__ROWS__", "\n".join(rows)).replace("__DATA__", data)
     document = document.replace("__EDITOR_DATA__", editor_data)
+    document = document.replace(
+        "The same eligible frames contribute to both images. Invalid shifted borders are excluded after registration.",
+        "These overviews use eligible frames. The registered view additionally excludes invalid source sampling and, "
+        "for local registration, unsupported correspondence. Contributions can differ by pixel; "
+        "use the matched-frame comparison above to inspect changes in sharpness.")
+    projection = manifest.get("projection_comparison")
+    if projection:
+        label = escape(str(projection["label"]))
+        viewer = escape(str(projection["paths"]["viewer"]), quote=True)
+        projection_link = (f'<section class="editor"><h2>{label} and sharpness comparison</h2>'
+                           f'<p><a href="{viewer}">Open native before/after {label} comparison and blink</a>. '
+                           'Both images use every selected frame and the same contrast window. '
+                           'Only invalid source sampling is omitted after alignment; failed or excluded '
+                           'frames remain in this diagnostic comparison.</p>'
+                           '<p><a href="minip.png">Curated projection PNG</a> · '
+                           '<a href="minip.nrrd">Curated projection NRRD</a>. '
+                           'The curated projection uses eligible frames and available matching support; '
+                           'apparent sharpness does not establish anatomical accuracy.</p></section>')
+        document = document.replace('<section class="editor" aria-label="Configuration editor">',
+                                    projection_link+'\n<section class="editor" aria-label="Configuration editor">')
+    if schema2:
+        document = document.replace('<script id="frame-data"', _DENSE_SECTION+'\n<script id="frame-data"')
+        document = document.replace("</body>", _DENSE_SCRIPT+"\n</body>")
+        document = document.replace("<th>dx (px)</th>", "<th>Coarse dx (px)</th>")
+        document = document.replace("<th>dy (px)</th>", "<th>Coarse dy (px)</th>")
+        document = document.replace("dx and dy are pixel translations applied to the moving frame to bring it into the reference grid. Positive dx moves pixels right; positive dy moves them down.",
+                                    "Coarse dx/dy summarize global initialization only. The complete local transform is the saved pull-displacement field; rotation/scale and local deformation cannot be summarized by these two numbers.")
+        document = document.replace("Orange marks invalid shifted borders.","Orange in the main overlay marks invalid source sampling.")
     path = directory / "report.html"
     path.write_text(document, encoding="utf-8")
     return path
@@ -173,3 +314,80 @@ leftImage.addEventListener('load',renderROI);window.addEventListener('resize',re
 scrub.oninput=()=>show(Number(scrub.value));mode.onchange=()=>show(selected);document.getElementById('previous').onclick=()=>show(selected-1);document.getElementById('next').onclick=()=>show(selected+1);document.addEventListener('keydown',e=>{if(['SELECT','INPUT','TEXTAREA'].includes(e.target.tagName))return;if(e.key==='ArrowLeft'){e.preventDefault();show(selected-1)}if(e.key==='ArrowRight'){e.preventDefault();show(selected+1)}});show(0);
 updateEditor();
 </script></body></html>'''
+
+
+_DENSE_SECTION = r'''
+<section class="editor" aria-label="Local deformation review">
+<h2>Local registration and anatomical review</h2>
+<p id="dense-method"></p>
+<p>Coarse dx/dy describe initialization only. The saved displacement field contains the complete transform.
+Orange in the correspondence view marks unsupported matching; the confidence view is a screening score,
+not a probability of anatomical correctness. Click an image or its full-resolution link to inspect small vessels.</p>
+<div class="controls"><label>Additional view <select id="extra-mode">
+<option value="support">Correspondence support</option><option value="confidence">Matching confidence (red low, green high)</option>
+<option value="coarse">Coarse global overlay</option><option value="displacement">Displacement magnitude (relative color scale)</option>
+<option value="deformation">Pull grid on original moving image</option></select></label>
+<button id="blink-final">Blink reference / final</button><a id="final-full" target="_blank">Final overlay at full resolution</a>
+<a id="original-full" target="_blank">Original source at full resolution</a><a href="review/reference-full.png" target="_blank">Original reference at full resolution</a></div>
+<figure class="pane"><figcaption id="extra-caption"></figcaption><a id="extra-link" target="_blank"><img id="extra-image" alt="Registration screening map"></a></figure>
+<details><summary>Saved numerical quality diagnostics</summary><pre id="dense-qa" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></details>
+<h2>Record a review decision</h2>
+<p>A numerical candidate remains unapproved until you review shared branches. Accepted regions are in the
+fixed reference image coordinates, [x, y, width, height]. Mark only regions whose anatomy and label coverage you
+actually inspected. Leaving regions empty records a frame decision without declaring label coverage.
+A reference identity transform never establishes full-tree completeness.</p>
+<div class="controls"><label>Displayed frame <select id="review-decision"><option value="pending">Pending</option><option value="accepted">Anatomically reviewed</option><option value="rejected">Rejected</option></select></label>
+<label>Reviewed reference regions <input id="review-regions" size="42" placeholder="[[100,200,150,120]]" aria-label="Reviewed reference regions"></label></div>
+<label>Review notes <input id="review-notes" size="75" aria-label="Anatomical review notes"></label>
+<div class="controls"><button id="save-decision">Record displayed frame decision</button><button id="download-decisions">Download review decisions</button></div>
+<p id="review-message" role="status"></p>
+</section>
+<details class="editor"><summary>Collect independent anatomical correspondences</summary>
+<p>Use the original reference and original moving frame below. Click the same bifurcation in each image,
+then check the coordinates. Do not use evaluation points as fitting constraints. Different filling or a
+projected crossing is a reason to mark visibility ambiguous. Browser zoom or the full-resolution image links
+help place small branch points; these displays do not establish subpixel reader accuracy.</p>
+<div class="panes"><figure class="pane landmark-pane"><figcaption>Original reference <a href="review/reference-full.png" target="_blank">full resolution</a></figcaption>
+<img id="point-reference" src="review/reference-full.png" alt="Original reference for independent landmarks" style="max-height:none;height:auto;cursor:crosshair"></figure>
+<figure class="pane landmark-pane"><figcaption id="point-moving-caption">Original moving frame</figcaption><img id="point-moving" alt="Original moving image for independent landmarks" style="max-height:none;height:auto;cursor:crosshair"></figure></div>
+<div class="controls"><label>Point ID <input id="point-id" value="branch-1" size="16"></label>
+<label>Role <select id="point-role"><option value="evaluation">Evaluation (withheld)</option><option value="fitting">Fitting constraint</option></select></label>
+<label>Visibility <select id="point-visibility"><option value="shared">Shared</option><option value="reference_only">Reference only</option><option value="moving_only">Moving only</option><option value="ambiguous">Ambiguous</option></select></label></div>
+<div class="controls"><label>Reference x,y <input id="point-reference-xy" size="20" placeholder="[x,y]"></label>
+<label>Moving x,y <input id="point-moving-xy" size="20" placeholder="[x,y]"></label>
+<label>Reference width (px) <input id="point-width" type="number" min="0.01" step="any"></label></div>
+<div class="controls"><label>Branch/region <input id="point-region" size="24"></label><label>Notes <input id="point-notes" size="50"></label></div>
+<div class="controls"><button id="add-point">Record correspondence</button><button id="remove-point">Remove last correspondence</button><button id="download-points">Download landmark JSON</button></div>
+<p id="point-message" role="status"></p><pre id="point-list" style="white-space:pre-wrap"></pre>
+</details>'''
+
+
+_DENSE_SCRIPT = r'''<script>
+const decisions=new Map(),landmarks=[];
+let blinkTimer=null,blinkOn=false,pointSource=null;
+const byId=id=>document.getElementById(id);
+byId('dense-method').textContent='Method: '+editor.registration_method+' · group '+(editor.group_id||editor.run_id)+'. All methods require anatomical review.';
+function downloadJSON(value,suffix){if(!editor.manifest_sha256){throw new Error('The preparation manifest fingerprint is unavailable. Regenerate this report before recording evidence.')}const url=URL.createObjectURL(new Blob([JSON.stringify(value,null,2)+'\n'],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=editor.run_id.replace(/[^a-zA-Z0-9_.-]/g,'_')+suffix;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}
+function regionsFromText(text){const value=text.trim()?JSON.parse(text):[];if(!Array.isArray(value)||value.some(r=>!Array.isArray(r)||r.length!==4||!r.every(Number.isInteger)||r[0]<0||r[1]<0||r[2]<=0||r[3]<=0||r[0]+r[2]>width||r[1]+r[3]>height))throw new Error('Regions must be integer [x,y,width,height] rectangles inside the reference image.');return value}
+function renderExtra(){const f=frames[selected],key=byId('extra-mode').value,url=f.extra_urls[key];byId('extra-image').style.display=url?'block':'none';byId('extra-image').src=url||'';byId('extra-link').href=url||'#';byId('extra-caption').textContent='Source frame '+f.source+' · '+byId('extra-mode').selectedOptions[0].text+(url?'':' · unavailable');byId('dense-qa').textContent=JSON.stringify(f.qa,null,2);byId('final-full').href=f.full_urls.after;byId('original-full').href=f.full_urls.original}
+function stopBlink(){if(blinkTimer!==null){clearInterval(blinkTimer);blinkTimer=null}byId('blink-final').textContent='Blink reference / final'}
+const originalShow=show;
+show=function(i){stopBlink();originalShow(i);const f=frames[selected],overlay=mode.value==='overlay';byId('left-link').href=f.full_urls[overlay?'before':'original'];byId('right-link').href=f.full_urls[overlay?'after':'registered'];byId('status').textContent='Original frame '+f.source+' · '+f.status+' · coarse dx '+f.dx.toFixed(2)+' px, dy '+f.dy.toFixed(2)+' px · NCC '+f.before_ncc+' → '+f.after_ncc+(f.reason?' · '+f.reason:'');renderExtra();const d=decisions.get(f.source)||{decision:'pending',regions:[],notes:''};byId('review-decision').value=d.decision;byId('review-decision').options[1].disabled=!f.registration_valid;byId('review-regions').value=JSON.stringify(d.regions);byId('review-notes').value=d.notes;if(pointSource!==f.source){byId('point-reference-xy').value='';byId('point-moving-xy').value='';byId('point-width').value='';pointSource=f.source}byId('point-moving').src=f.full_urls.original;byId('point-moving-caption').textContent='Original source frame '+f.source};
+byId('extra-mode').onchange=renderExtra;
+const oldReferenceClick=byId('use-reference').onclick;
+byId('use-reference').onclick=()=>{const old=config.reference_frame;oldReferenceClick();if(old!==config.reference_frame&&config.registration){delete config.registration.fitting_landmarks;delete config.registration.paths;message.textContent+=' Deformable fitting landmarks and registration paths tied to the old reference were cleared.'}};
+const oldConfigClick=byId('download-config').onclick;
+byId('download-config').onclick=()=>{let removed=0;if(config.registration){if(config.registration.fitting_landmarks)config.registration.fitting_landmarks=Object.fromEntries(Object.entries(config.registration.fitting_landmarks).filter(([frame])=>included.has(Number(frame))&&Number(frame)!==config.reference_frame));if(config.registration.paths){const entries=Object.entries(config.registration.paths);const kept=entries.filter(([frame,path])=>included.has(Number(frame))&&Number(frame)!==config.reference_frame&&Array.isArray(path)&&path.every(source=>included.has(Number(source))));removed=entries.length-kept.length;config.registration.paths=Object.fromEntries(kept)}}oldConfigClick();if(removed)message.textContent+=' Removed '+removed+' registration path(s) that referenced excluded frames.'};
+byId('blink-final').onclick=()=>{if(blinkTimer!==null){stopBlink();show(selected);return}byId('blink-final').textContent='Stop blink';blinkOn=false;blinkTimer=setInterval(()=>{blinkOn=!blinkOn;byId('right').src=blinkOn?'review/reference-full.png':frames[selected].full_urls.registered;byId('right-caption').textContent=blinkOn?'Original reference':'Final registered source frame '+frames[selected].source},500)};
+byId('save-decision').onclick=()=>{try{const f=frames[selected],decision=byId('review-decision').value;if(decision==='accepted'&&!f.registration_valid)throw new Error('This transform failed numerical/support checks. A review decision cannot override a failed transform.');const regions=regionsFromText(byId('review-regions').value);if(decision!=='accepted'&&regions.length)throw new Error('Reviewed coverage regions require an accepted anatomical review decision.');decisions.set(f.source,{source_frame:f.source,decision,regions,notes:byId('review-notes').value});byId('review-message').textContent='Recorded original frame '+f.source+'. '+decisions.size+' frame decision(s) stored; download to preserve them.'}catch(e){byId('review-message').textContent=e.message}};
+byId('download-decisions').onclick=()=>{try{downloadJSON({schema_version:1,prepared_manifest_sha256:editor.manifest_sha256,group_id:editor.group_id,decisions:Array.from(decisions.values())},'-review.json');byId('review-message').textContent='Review decisions downloaded. Import this file into the matching Slicer session.'}catch(e){byId('review-message').textContent=e.message}};
+for(const side of ['reference','moving'])byId('point-'+side).onclick=event=>{const r=event.currentTarget.getBoundingClientRect();const x=Math.max(0,Math.min(width-1,(event.clientX-r.left)/r.width*width));const y=Math.max(0,Math.min(height-1,(event.clientY-r.top)/r.height*height));byId('point-'+side+'-xy').value=JSON.stringify([Number(x.toFixed(2)),Number(y.toFixed(2))])};
+function parsePoint(id){const raw=byId(id).value.trim();if(!raw)return null;const p=JSON.parse(raw);if(!Array.isArray(p)||p.length!==2||!p.every(Number.isFinite)||p[0]<0||p[1]<0||p[0]>width-1||p[1]>height-1)throw new Error('Points must be finite [x,y] coordinates inside the original image.');return p}
+function renderPoints(){byId('point-list').textContent=landmarks.map(p=>'Frame '+p.source_frame+' / '+p.point_id+' / '+p.role+' / '+p.visibility+' / '+JSON.stringify(p.reference)+' ↔ '+JSON.stringify(p.moving)).join('\n')}
+byId('add-point').onclick=()=>{try{const f=frames[selected],visibility=byId('point-visibility').value,reference=parsePoint('point-reference-xy'),moving=parsePoint('point-moving-xy'),id=byId('point-id').value.trim();if(!id)throw new Error('Provide a branch point ID.');if(landmarks.some(p=>p.source_frame===f.source&&p.point_id===id))throw new Error('This frame/point ID is already recorded.');if(visibility==='shared'&&(!reference||!moving))throw new Error('Shared points require both reference and moving coordinates.');if(visibility==='reference_only'&&(!reference||moving))throw new Error('Reference-only points require reference coordinates and an empty moving field.');if(visibility==='moving_only'&&(!moving||reference))throw new Error('Moving-only points require moving coordinates and an empty reference field.');const raw=byId('point-width').value.trim(),w=raw?Number(raw):null;if(w!==null&&(!Number.isFinite(w)||w<=0))throw new Error('Vessel width must be positive when provided.');landmarks.push({source_frame:f.source,point_id:id,role:byId('point-role').value,visibility,reference,moving,reference_width_px:w,region:byId('point-region').value,notes:byId('point-notes').value});renderPoints();byId('point-message').textContent='Recorded '+landmarks.length+' correspondences; download to preserve them.';byId('point-id').value='branch-'+(landmarks.length+1)}catch(e){byId('point-message').textContent=e.message}};
+byId('remove-point').onclick=()=>{landmarks.pop();renderPoints()};
+byId('download-points').onclick=()=>{try{downloadJSON({schema_version:1,prepared_manifest_sha256:editor.manifest_sha256,coordinate_convention:'original_full_resolution_xy',landmarks},'-landmarks.json');byId('point-message').textContent='Landmark JSON downloaded. Use dsa-preprocess evaluate with this prepared directory.'}catch(e){byId('point-message').textContent=e.message}};
+// The original-image click is reserved for drawing the pending registration ROI.
+// Its full-resolution file remains available through the separate final/original links.
+show(selected);
+</script>'''

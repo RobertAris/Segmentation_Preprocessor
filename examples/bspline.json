@@ -1,0 +1,10 @@
+{
+  "polarity": "dark",
+  "registration": {
+    "method": "bspline",
+    "global_model": "translation",
+    "pyramid_scales": [2, 1],
+    "grid_spacings_px": [128, 64],
+    "regularization": 1.0
+  }
+}

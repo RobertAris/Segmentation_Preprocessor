@@ -4,19 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsa-preprocessor"
-version = "0.1.0"
-description = "Translation registration and static vessel annotation preparation for 2D DSA sequences"
+version = "0.2.0"
+description = "Reference alignment and static vessel annotation preparation for 2D DSA sequences"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26", "scipy>=1.12", "scikit-image>=0.23", "pynrrd>=1.0", "pillow>=10"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+registration = ["SimpleITK>=2.4"]
 
 [project.scripts]
 dsa-preprocess = "dsa_preprocessor.cli:main"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["dsa_preprocessor*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

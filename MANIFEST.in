@@ -1,0 +1,43 @@
+# Public distribution: package code plus only explicitly listed public
+# documentation, examples, and the Slicer launcher. Private runtime data,
+# configuration, and build artifacts are excluded below.
+
+# Project metadata and launcher (filename contains spaces; use a ? matching
+# pattern so MANIFEST's whitespace tokenizer keeps it on one line)
+include README.md
+include pyproject.toml
+include Start?DSA?Workflow.command
+
+# Public Slicer helper scripts and documentation only
+include slicer/DSAWorkflow.py
+include slicer/LaunchDSA.py
+include slicer/README.md
+include docs/deformable-alignment.md
+include docs/development.md
+include scripts/normalize_sdist.py
+
+# Package source and synthetic tests only
+recursive-include src/dsa_preprocessor *.py
+recursive-include tests *.py
+recursive-include examples *.json
+
+# Never distribute private runtime, data, or build outputs
+prune outputs
+prune configs
+prune handoff
+prune .ai-lab
+prune .venv
+prune dist
+prune build
+
+# Exclude bytecode, caches, and image/scene data formats
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude .pytest_cache
+global-exclude *.egg-info
+global-exclude *.nrrd
+global-exclude *.seg
+global-exclude *.mrb
+global-exclude *.mha
+global-exclude *.mhd

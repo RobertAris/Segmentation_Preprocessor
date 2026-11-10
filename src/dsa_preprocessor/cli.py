@@ -63,7 +63,7 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect", help="List NRRD runs without modifying the dataset")
     inspect.add_argument("dataset", type=Path)
     inspect.add_argument("--json", action="store_true", help="Print complete inventory as JSON")
-    inspect.add_argument("--subjects", nargs="+", help="Only these subject folders, e.g. sub-h001 sub-r005")
+    inspect.add_argument("--subjects", nargs="+", help="Only these subject folders, e.g. sub-example01 sub-example02")
 
     config = sub.add_parser("configure", help="Write an editable starting configuration")
     config.add_argument("input", type=Path)
@@ -78,6 +78,19 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--roi", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
     prepare.add_argument("--max-shift-px", type=float)
     prepare.add_argument("--polarity", choices=("dark", "bright"))
+    prepare.add_argument("--registration-method", choices=("translation", "rigid", "similarity", "affine", "bspline", "tvl1", "demons"),
+                         help="Opt in to schema-2 vessel registration; all results require anatomical review")
+
+    evaluate = sub.add_parser("evaluate", help="Measure independent vessel landmarks in reference coordinates")
+    evaluate.add_argument("prepared", type=Path)
+    evaluate.add_argument("--landmarks", type=Path)
+    evaluate.add_argument("--template", action="store_true", help="Create an empty fingerprinted landmark collection packet")
+    evaluate.add_argument("-o", "--output", required=True, type=Path)
+
+    pilot = sub.add_parser("pilot", help="Run a fixed comparison packet with a pair-fit budget")
+    pilot.add_argument("packet", type=Path)
+    pilot.add_argument("-o", "--output", required=True, type=Path)
+    pilot.add_argument("--max-fits", type=int, help="Override packet cap; must be at most 160, including reverse/retry jobs")
 
     batch = sub.add_parser("batch", help="Prepare dataset runs separately and record failures")
     batch.add_argument("dataset", type=Path)
@@ -123,12 +136,42 @@ def main(argv: list[str] | None = None) -> int:
                 value = getattr(args, field)
                 if value is not None:
                     config[field] = value
+            if args.registration_method is not None:
+                nested = config.get("registration", {})
+                if not isinstance(nested, dict):
+                    raise ValueError("registration must be an object")
+                config["registration"] = {**nested, "method": args.registration_method}
             manifest = pipeline.prepare(args.input, args.output, config)
             flagged = sum(frame.get("status") not in ("accepted", "reference", "manual", "ok", "estimated")
                           for frame in manifest["frames"])
-            print(f"Prepared {len(manifest['frames'])} frame(s); {flagged} automatically flagged. All alignments need visual review.")
+            if manifest.get("schema_version") == 2:
+                candidates = sum(frame.get("registration_valid", False) for frame in manifest["frames"])
+                print(f"Prepared {len(manifest['frames'])} frame(s); {candidates} numerically supported candidates. Anatomical review is required.")
+            else:
+                print(f"Prepared {len(manifest['frames'])} frame(s); {flagged} automatically flagged. All alignments need visual review.")
             print(f"Review: {(args.output / 'report.html').resolve()}")
             return 0
+        if args.command == "evaluate":
+            from .evaluation import annotation_template, evaluate_landmarks
+            if args.template == (args.landmarks is not None):
+                raise ValueError("Choose either --template or --landmarks FILE")
+            result = annotation_template(args.prepared) if args.template else evaluate_landmarks(args.prepared, args.landmarks)
+            prepared_manifest = json.loads((args.prepared / "manifest.json").read_text())
+            source = prepared_manifest.get("source_file")
+            dataset = pipeline._dataset_root(source) if source else None
+            if dataset and args.output.expanduser().resolve().is_relative_to(dataset):
+                raise ValueError("Write evaluation derivatives outside the source dataset")
+            _write_json_new(args.output, result)
+            print(args.output.resolve())
+            if not args.template:
+                print(f"{result['status']}; anatomical acceptance remains subject to independent review")
+            return 0
+        if args.command == "pilot":
+            from .pilot import run_pilot
+            result = run_pilot(args.packet, args.output, max_fits=args.max_fits)
+            print(f"{result['status']}; reserved {result['reserved_pair_fits']}/{result['max_fits']} pair fits")
+            print((args.output / "pilot_summary.json").resolve())
+            return 1 if result["status"] == "completed_with_failures" else 0
         if args.command == "batch":
             if args.limit is not None and args.limit < 1:
                 raise ValueError("--limit must be a positive integer")
